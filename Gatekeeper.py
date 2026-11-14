@@ -130,7 +130,7 @@ async def set_cooldown(
 ):
   if amount < 0:
     await interaction.response.send_message(
-        "❌ กรุณาใส่ตัวเลข 0 ขึ้นไปครับ", ephemeral=True
+        "❌ กรุณาใส่ตัวเลข 0 ขึ้นไป", ephemeral=True
     )
     return
 
@@ -241,7 +241,7 @@ async def on_message(message):
 
     state["image_until"] = now + cd
     info = await message.channel.send(
-        f"🖼️ **ล็อกการส่งรูปภาพ/ไฟล์ชั่วคราว!** กรุณารอ **{format_time(cd)}**"
+        f"**ล็อกการส่งรูปภาพ/ไฟล์ชั่วคราว!** กรุณารอ **{format_time(cd)}**"
         " ก่อนส่งรูปถัดไป *(ยังพิมพ์ข้อความคุยได้ปกติ)*"
     )
     await asyncio.sleep(cd)
@@ -274,7 +274,7 @@ async def on_message(message):
 
     state["text_until"] = now + cd
     info = await message.channel.send(
-        f"💬 **ล็อกการส่งข้อความชั่วคราว!** กรุณารอ **{format_time(cd)}**"
+        f"**ล็อกการส่งข้อความชั่วคราว!** กรุณารอ **{format_time(cd)}**"
         " ก่อนส่งข้อความถัดไป"
     )
     await asyncio.sleep(cd)
