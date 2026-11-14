@@ -47,16 +47,14 @@ def get_guild_config(guild_id):
   if g_id not in config:
     config[g_id] = {
         "channel_id": None,
-        "text_cooldown": 0,  # 0 = ไม่ล็อกข้อความ
-        "image_cooldown": 300,  # ค่าเริ่มต้นรูปภาพ = 5 นาที
+        "text_cooldown": 0,
+        "image_cooldown": 300,
     }
     save_config(config)
   return config[g_id]
 
 
 config = load_config()
-
-# เก็บสถานะการล็อกแยกตามห้อง: { channel_id: {"text_until": timestamp, "image_until": timestamp} }
 lock_states = {}
 
 # --- ตั้งค่าบอท Discord ---
@@ -80,7 +78,7 @@ def format_time(seconds: int) -> str:
     return f"{seconds} วินาที"
 
 
-# --- คำสั่ง Slash Commands ---
+# --- คำสั่ง Slash Commands (แสดงข้อความให้ทุกคนเห็นในแชท) ---
 
 
 @bot.tree.command(
@@ -94,8 +92,8 @@ async def set_channel(
   g_conf["channel_id"] = channel.id
   save_config(config)
   await interaction.response.send_message(
-      f"✅ เปิดใช้งานระบบล็อกเวลาที่ห้อง {channel.mention} เรียบร้อยแล้ว!",
-      ephemeral=True,
+      f"✅ {interaction.user.mention} เปิดใช้งานระบบล็อกเวลาที่ห้อง"
+      f" {channel.mention} เรียบร้อยแล้ว!"
   )
 
 
@@ -147,14 +145,17 @@ async def set_cooldown(
   save_config(config)
 
   if total_seconds == 0:
-    msg = f"✅ **ปิดการล็อก** สำหรับ **{target.name}** เรียบร้อยแล้ว!"
+    msg = (
+        f"✅ {interaction.user.mention} **ปิดการล็อก** สำหรับ **{target.name}**"
+        " เรียบร้อยแล้ว!"
+    )
   else:
     msg = (
-        f"✅ ตั้งเวลาล็อก **{target.name}** เป็น **{amount} {unit.name}**"
-        " เรียบร้อย!"
+        f"✅ {interaction.user.mention} ตั้งเวลาล็อก **{target.name}** เป็น"
+        f" **{amount} {unit.name}** เรียบร้อย!"
     )
 
-  await interaction.response.send_message(msg, ephemeral=True)
+  await interaction.response.send_message(msg)
 
 
 @bot.tree.command(
@@ -166,7 +167,8 @@ async def disable(interaction: discord.Interaction):
   g_conf["channel_id"] = None
   save_config(config)
   await interaction.response.send_message(
-      "🛑 ปิดการทำงานของระบบล็อกเวลาในเซิร์ฟเวอร์นี้แล้ว", ephemeral=True
+      f"🛑 {interaction.user.mention}"
+      " ปิดการทำงานของระบบล็อกเวลาในเซิร์ฟเวอร์นี้แล้ว"
   )
 
 
@@ -191,7 +193,7 @@ async def status(interaction: discord.Interaction):
   embed.add_field(name="📍 ห้องที่ใช้งาน", value=ch_text, inline=False)
   embed.add_field(name="💬 ล็อกข้อความ", value=t_str, inline=True)
   embed.add_field(name="🖼️ ล็อกรูปภาพ/ไฟล์", value=i_str, inline=True)
-  await interaction.response.send_message(embed=embed, ephemeral=True)
+  await interaction.response.send_message(embed=embed)
 
 
 # --- ระบบตรวจจับและบังคับล็อกทุกคน (รวม Owner/Admin) ---
@@ -219,9 +221,8 @@ async def on_message(message):
   if has_media:
     cd = g_conf["image_cooldown"]
     if cd <= 0:
-      return  # ถ้าไม่ได้ตั้งล็อกรูปภาพไว้ ก็ปล่อยผ่าน
+      return
 
-    # เช็กว่าติดล็อกรูปภาพอยู่หรือไม่
     if now < state["image_until"]:
       remaining = int(state["image_until"] - now)
       try:
@@ -238,7 +239,6 @@ async def on_message(message):
         )
       return
 
-    # ถ้ายังไม่ติดล็อก -> เริ่มนับคูลดาวน์รูปภาพใหม่ทันที
     state["image_until"] = now + cd
     info = await message.channel.send(
         f"🖼️ **ล็อกการส่งรูปภาพ/ไฟล์ชั่วคราว!** กรุณารอ **{format_time(cd)}**"
@@ -250,13 +250,12 @@ async def on_message(message):
     except:
       pass
 
-  # กรณีที่ 2: ส่งข้อความธรรมดา (ไม่มีไฟล์แนบ)
+  # กรณีที่ 2: ส่งข้อความธรรมดา
   else:
     cd = g_conf["text_cooldown"]
     if cd <= 0:
-      return  # ถ้าไม่ได้ตั้งล็อกข้อความไว้ ก็ปล่อยผ่าน
+      return
 
-    # เช็กว่าติดล็อกข้อความอยู่หรือไม่
     if now < state["text_until"]:
       remaining = int(state["text_until"] - now)
       try:
@@ -273,7 +272,6 @@ async def on_message(message):
         )
       return
 
-    # ถ้ายังไม่ติดล็อก -> เริ่มนับคูลดาวน์ข้อความใหม่ทันที
     state["text_until"] = now + cd
     info = await message.channel.send(
         f"💬 **ล็อกการส่งข้อความชั่วคราว!** กรุณารอ **{format_time(cd)}**"
