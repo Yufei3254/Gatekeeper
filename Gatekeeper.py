@@ -26,7 +26,7 @@ def keep_alive():
   t.start()
 
 
-# --- ระบบอ่าน/บันทึกการตั้งค่าลงใน Channel Topic (จำถาวรไม่มีวันหาย) ---
+# --- ระบบอ่าน/บันทึกการตั้งค่าลงใน Channel Topic ---
 def get_channel_config(channel: discord.TextChannel):
   topic = channel.topic or ""
   match = re.search(r"\[GK:T=(\d+),I=(\d+)\]", topic)
@@ -56,6 +56,7 @@ async def save_channel_config(
 
 lock_states = {}
 allowed_messages = set()
+processing_messages = set()  # กันบอททำงานซ้อนกับข้อความเดิม
 
 # --- ตั้งค่าบอท Discord ---
 intents = discord.Intents.default()
@@ -144,7 +145,6 @@ async def set_cooldown(
       msg = (
           f"✅ {interaction.user.mention} ตั้งเวลาล็อก **{target.name}** ในห้อง"
           f" {channel.mention} เป็น **{amount} {unit.name}** เรียบร้อย"
-          " *(บันทึกถาวร)*"
       )
     await interaction.followup.send(msg)
   except discord.Forbidden:
@@ -190,9 +190,7 @@ async def status(
   t_str = format_time(t_cd) if t_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
   i_str = format_time(i_cd) if i_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
 
-  status_text = (
-      "เปิดใช้งานอยู่ (บันทึกถาวร)" if conf["active"] else "ปิดใช้งานอยู่"
-  )
+  status_text = "เปิดใช้งานอยู่" if conf["active"] else "ปิดใช้งานอยู่"
 
   embed = discord.Embed(
       title=f"สถานะระบบคูลดาวน์ของห้อง #{target_channel.name}",
@@ -204,14 +202,29 @@ async def status(
   await interaction.response.send_message(embed=embed)
 
 
+# --- ฟังก์ชันลบข้อความแบบปลอดภัย (ป้องกันบั๊กภาพค้างและบั๊กลบซ้ำ) ---
+async def delete_and_warn(message, delay_before_delete: float, warn_text: str):
+  try:
+    # รอให้ Discord อัปโหลดไฟล์/รูปภาพเสร็จสมบูรณ์ก่อนลบ เพื่อไม่ให้ภาพค้างในหน้าจอคนส่ง
+    await asyncio.sleep(delay_before_delete)
+    await message.delete()
+
+    # แจ้งเตือนในช่องแชท 3 วินาที แล้วลบออกอัตโนมัติ (ไม่ส่ง DM)
+    warn = await message.channel.send(
+        f"{message.author.mention} {warn_text}", delete_after=3.0
+    )
+  except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+    pass
+  finally:
+    processing_messages.discard(message.id)
+
+
 # --- ฟังก์ชันตรวจจับและจัดการข้อความ ---
-
-
 async def process_message(message, is_edit=False):
   if message.author.bot or not message.guild:
     return
 
-  if message.id in allowed_messages:
+  if message.id in allowed_messages or message.id in processing_messages:
     return
 
   conf = get_channel_config(message.channel)
@@ -243,32 +256,30 @@ async def process_message(message, is_edit=False):
       return
 
     if now < state["image_until"]:
+      processing_messages.add(message.id)
       remaining = max(1, int(state["image_until"] - now))
-      try:
-        await message.delete()
-        warn = await message.channel.send(
-            f"{message.author.mention} **ติดคูลดาวน์รูปภาพ/ลิงก์**"
-            f" กรุณารออีก **{format_time(remaining)}**"
-        )
-        await asyncio.sleep(5)
-        await warn.delete()
-      except discord.Forbidden:
-        pass
+      # หน่วงเวลา 1.5 วินาทีสำหรับรูปภาพ เพื่อแก้ปัญหาภาพค้างในหน้าจอคนส่ง
+      asyncio.create_task(
+          delete_and_warn(
+              message,
+              1.5,
+              "**ติดคูลดาวน์รูปภาพ/ลิงก์** กรุณารออีก"
+              f" **{format_time(remaining)}**",
+          )
+      )
       return
 
     allowed_messages.add(message.id)
     state["image_until"] = now + cd
 
-    info = await message.channel.send(
+    # แจ้งเตือนล็อกห้องและตั้งเวลาลบตัวเองอัตโนมัติ (delete_after) เพื่อกันบั๊กค้าง
+    await message.channel.send(
         f"**ล็อกการส่งรูปภาพ/ลิงก์ชั่วคราว** กรุณารอ **{format_time(cd)}**"
-        " ก่อนส่งรายการถัดไป"
+        " ก่อนส่งรายการถัดไป",
+        delete_after=float(cd),
     )
     await asyncio.sleep(cd)
     allowed_messages.discard(message.id)
-    try:
-      await info.delete()
-    except:
-      pass
 
   # 2. หมวดข้อความธรรมดา
   elif not is_edit:
@@ -277,32 +288,28 @@ async def process_message(message, is_edit=False):
       return
 
     if now < state["text_until"]:
+      processing_messages.add(message.id)
       remaining = max(1, int(state["text_until"] - now))
-      try:
-        await message.delete()
-        warn = await message.channel.send(
-            f"{message.author.mention} **ติดคูลดาวน์ข้อความ**"
-            f" กรุณารออีก **{format_time(remaining)}**"
-        )
-        await asyncio.sleep(5)
-        await warn.delete()
-      except discord.Forbidden:
-        pass
+      # หน่วงเวลา 0.6 วินาทีสำหรับข้อความธรรมดา เพื่อไม่ให้ข้อความค้างในหน้าจอ
+      asyncio.create_task(
+          delete_and_warn(
+              message,
+              0.6,
+              f"**ติดคูลดาวน์ข้อความ** กรุณารออีก **{format_time(remaining)}**",
+          )
+      )
       return
 
     allowed_messages.add(message.id)
     state["text_until"] = now + cd
 
-    info = await message.channel.send(
+    await message.channel.send(
         f"**ล็อกการส่งข้อความชั่วคราว** กรุณารอ **{format_time(cd)}**"
-        " ก่อนส่งข้อความถัดไป"
+        " ก่อนส่งข้อความถัดไป",
+        delete_after=float(cd),
     )
     await asyncio.sleep(cd)
     allowed_messages.discard(message.id)
-    try:
-      await info.delete()
-    except:
-      pass
 
 
 @bot.event
