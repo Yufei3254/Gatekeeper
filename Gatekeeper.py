@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from threading import Thread
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,7 +14,7 @@ app = Flask("")
 
 @app.route("/")
 def home():
-  return "Bot is alive and ready for all servers!"
+  return "Gatekeeper Bot is alive!"
 
 
 def run():
@@ -21,30 +22,19 @@ def run():
 
 
 def keep_alive():
-  t = Thread(target=run, daemon=True)
+  t = Thread(target=run)
   t.start()
 
 
-# --- ระบบจัดการการตั้งค่าแบบแยกเซิร์ฟเวอร์ ---
+# --- ระบบจัดการการตั้งค่าแยกตามเซิร์ฟเวอร์ ---
 CONFIG_FILE = "servers_config.json"
-DEFAULT_GUILD_CONFIG = {
-    "channel_id": None,
-    "text_cooldown": 300,  # ค่าเริ่มต้นข้อความ: 5 นาที
-    "image_cooldown": 600,  # ค่าเริ่มต้นรูปภาพ: 10 นาที
-}
 
 
 def load_config():
-  config = {}
   if os.path.exists(CONFIG_FILE):
-    try:
-      with open(CONFIG_FILE, "r") as f:
-        loaded = json.load(f)
-      if isinstance(loaded, dict):
-        config = loaded
-    except (json.JSONDecodeError, OSError):
-      pass
-  return config
+    with open(CONFIG_FILE, "r") as f:
+      return json.load(f)
+  return {}
 
 
 def save_config(data):
@@ -55,15 +45,19 @@ def save_config(data):
 def get_guild_config(guild_id):
   g_id = str(guild_id)
   if g_id not in config:
-    config[g_id] = DEFAULT_GUILD_CONFIG.copy()
+    config[g_id] = {
+        "channel_id": None,
+        "text_cooldown": 0,  # 0 = ไม่ล็อกข้อความ
+        "image_cooldown": 300,  # ค่าเริ่มต้นรูปภาพ = 5 นาที
+    }
     save_config(config)
-  else:
-    config[g_id] = {**DEFAULT_GUILD_CONFIG, **config[g_id]}
   return config[g_id]
 
 
 config = load_config()
-locked_channels = set()  # เก็บรายชื่อ ID ห้องที่กำลังถูกล็อกอยู่ (แยกตามห้อง)
+
+# เก็บสถานะการล็อกแยกตามห้อง: { channel_id: {"text_until": timestamp, "image_until": timestamp} }
+lock_states = {}
 
 # --- ตั้งค่าบอท Discord ---
 intents = discord.Intents.default()
@@ -74,13 +68,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
   await bot.tree.sync()
-  print(
-      f"บอทออนไลน์แล้วในชื่อ: {bot.user} (พร้อมใช้งานใน {len(bot.guilds)}"
-      " เซิร์ฟเวอร์)"
-  )
+  print(f"บอทออนไลน์แล้ว: {bot.user}")
 
 
-# --- คำสั่ง Slash Commands สำหรับแอดมินแต่ละเซิร์ฟเวอร์ ---
+def format_time(seconds: int) -> str:
+  if seconds >= 3600 and seconds % 3600 == 0:
+    return f"{seconds // 3600} ชั่วโมง"
+  elif seconds >= 60 and seconds % 60 == 0:
+    return f"{seconds // 60} นาที"
+  else:
+    return f"{seconds} วินาที"
+
+
+# --- คำสั่ง Slash Commands ---
 
 
 @bot.tree.command(
@@ -100,44 +100,61 @@ async def set_channel(
 
 
 @bot.tree.command(
-    name="set_text", description="ตั้งเวลาล็อกเมื่อมีคนส่งข้อความ (หน่วย: วินาที)"
+    name="set_cooldown",
+    description="ตั้งเวลาดีเลย์ (เลือกประเภทและหน่วยเวลาได้เอง)",
 )
-@app_commands.describe(seconds="ใส่จำนวนวินาที (เช่น 300 = 5 นาที, 0 = ไม่ล็อก)")
+@app_commands.describe(
+    target="เลือกสิ่งที่จะล็อก (ข้อความ หรือ รูปภาพ/ไฟล์)",
+    amount="ใส่จำนวนเวลา (ใส่ 0 เพื่อปิดการล็อกประเภทนี้)",
+    unit="เลือกหน่วยเวลา (วินาที / นาที / ชั่วโมง)",
+)
+@app_commands.choices(
+    target=[
+        app_commands.Choice(
+            name="💬 ข้อความอย่างเดียว (Text Only)", value="text"
+        ),
+        app_commands.Choice(
+            name="🖼️ รูปภาพ/วิดีโอ/ไฟล์ (Media/Files)", value="image"
+        ),
+    ],
+    unit=[
+        app_commands.Choice(name="วินาที (Seconds)", value=1),
+        app_commands.Choice(name="นาที (Minutes)", value=60),
+        app_commands.Choice(name="ชั่วโมง (Hours)", value=3600),
+    ],
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def set_text(interaction: discord.Interaction, seconds: int):
-  if seconds < 0:
+async def set_cooldown(
+    interaction: discord.Interaction,
+    target: app_commands.Choice[str],
+    amount: int,
+    unit: app_commands.Choice[int],
+):
+  if amount < 0:
     await interaction.response.send_message(
         "❌ กรุณาใส่ตัวเลข 0 ขึ้นไปครับ", ephemeral=True
     )
     return
+
+  total_seconds = amount * unit.value
   g_conf = get_guild_config(interaction.guild_id)
-  g_conf["text_cooldown"] = seconds
+
+  if target.value == "text":
+    g_conf["text_cooldown"] = total_seconds
+  else:
+    g_conf["image_cooldown"] = total_seconds
+
   save_config(config)
-  await interaction.response.send_message(
-      f"✅ ตั้งเวลาล็อกเมื่อส่ง **ข้อความ** เป็น **{seconds} วินาที** เรียบร้อย!",
-      ephemeral=True,
-  )
 
-
-@bot.tree.command(
-    name="set_image",
-    description="ตั้งเวลาล็อกเมื่อมีคนส่งรูปภาพหรือไฟล์ (หน่วย: วินาที)",
-)
-@app_commands.describe(seconds="ใส่จำนวนวินาที (เช่น 600 = 10 นาที, 0 = ไม่ล็อก)")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_image(interaction: discord.Interaction, seconds: int):
-  if seconds < 0:
-    await interaction.response.send_message(
-        "❌ กรุณาใส่ตัวเลข 0 ขึ้นไปครับ", ephemeral=True
+  if total_seconds == 0:
+    msg = f"✅ **ปิดการล็อก** สำหรับ **{target.name}** เรียบร้อยแล้ว!"
+  else:
+    msg = (
+        f"✅ ตั้งเวลาล็อก **{target.name}** เป็น **{amount} {unit.name}**"
+        " เรียบร้อย!"
     )
-    return
-  g_conf = get_guild_config(interaction.guild_id)
-  g_conf["image_cooldown"] = seconds
-  save_config(config)
-  await interaction.response.send_message(
-      f"✅ ตั้งเวลาล็อกเมื่อส่ง **รูปภาพ/ไฟล์** เป็น **{seconds} วินาที** เรียบร้อย!",
-      ephemeral=True,
-  )
+
+  await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(
@@ -149,9 +166,7 @@ async def disable(interaction: discord.Interaction):
   g_conf["channel_id"] = None
   save_config(config)
   await interaction.response.send_message(
-      "🛑 ปิดการทำงานของระบบล็อกเวลาในเซิร์ฟเวอร์นี้แล้ว (ใช้ /set_channel"
-      " เพื่อเปิดใหม่)",
-      ephemeral=True,
+      "🛑 ปิดการทำงานของระบบล็อกเวลาในเซิร์ฟเวอร์นี้แล้ว", ephemeral=True
   )
 
 
@@ -163,97 +178,113 @@ async def status(interaction: discord.Interaction):
   ch_id = g_conf.get("channel_id")
   ch_text = f"<#{ch_id}>" if ch_id else "ปิดใช้งานอยู่ (ใช้ /set_channel เพื่อเปิด)"
 
+  t_cd = g_conf["text_cooldown"]
+  i_cd = g_conf["image_cooldown"]
+
+  t_str = format_time(t_cd) if t_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
+  i_str = format_time(i_cd) if i_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
+
   embed = discord.Embed(
       title=f"⚙️ สถานะระบบคูลดาวน์ ({interaction.guild.name})",
-      color=discord.Color.green(),
+      color=discord.Color.blue(),
   )
   embed.add_field(name="📍 ห้องที่ใช้งาน", value=ch_text, inline=False)
-  embed.add_field(
-      name="💬 ดีเลย์ข้อความ",
-      value=f"{g_conf['text_cooldown']} วินาที",
-      inline=True,
-  )
-  embed.add_field(
-      name="🖼️ ดีเลย์รูปภาพ/ไฟล์",
-      value=f"{g_conf['image_cooldown']} วินาที",
-      inline=True,
-  )
+  embed.add_field(name="💬 ล็อกข้อความ", value=t_str, inline=True)
+  embed.add_field(name="🖼️ ล็อกรูปภาพ/ไฟล์", value=i_str, inline=True)
   await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- ระบบตรวจจับข้อความและรูปภาพ ---
+# --- ระบบตรวจจับและบังคับล็อกทุกคน (รวม Owner/Admin) ---
 
 
 @bot.event
 async def on_message(message):
-  # ข้ามข้อความจากบอท หรือข้อความส่วนตัว (DM)
   if message.author.bot or not message.guild:
     return
 
   g_conf = get_guild_config(message.guild.id)
-
-  # ตรวจสอบว่าเป็นห้องที่ตั้งค่าไว้หรือไม่
   if not g_conf["channel_id"] or message.channel.id != g_conf["channel_id"]:
     return
 
-  # ถ้าห้องนี้กำลังถูกล็อกอยู่ ให้ข้ามไป
-  if message.channel.id in locked_channels:
-    return
+  ch_id = message.channel.id
+  now = time.time()
 
-  # ตรวจสอบว่าเป็นรูปภาพ/ไฟล์แนบ หรือข้อความ
+  if ch_id not in lock_states:
+    lock_states[ch_id] = {"text_until": 0, "image_until": 0}
+
+  state = lock_states[ch_id]
   has_media = len(message.attachments) > 0
+
+  # กรณีที่ 1: ส่งรูปภาพ / วิดีโอ / ไฟล์
   if has_media:
-    cooldown = g_conf["image_cooldown"]
-    msg_type = "รูปภาพ/ไฟล์"
-  else:
-    cooldown = g_conf["text_cooldown"]
-    msg_type = "ข้อความ"
+    cd = g_conf["image_cooldown"]
+    if cd <= 0:
+      return  # ถ้าไม่ได้ตั้งล็อกรูปภาพไว้ ก็ปล่อยผ่าน
 
-  if cooldown <= 0:
-    return
+    # เช็กว่าติดล็อกรูปภาพอยู่หรือไม่
+    if now < state["image_until"]:
+      remaining = int(state["image_until"] - now)
+      try:
+        await message.delete()
+        warn = await message.channel.send(
+            f"⏳ {message.author.mention} **ติดคูลดาวน์รูปภาพ/ไฟล์!** กรุณารออีก"
+            f" **{format_time(remaining)}**"
+        )
+        await asyncio.sleep(5)
+        await warn.delete()
+      except discord.Forbidden:
+        await message.channel.send(
+            "⚠️ บอทไม่มีสิทธิ์ลบข้อความ! กรุณาเปิดสิทธิ์ `Manage Messages` ให้บอท"
+        )
+      return
 
-  # เริ่มล็อกเฉพาะห้องนี้
-  locked_channels.add(message.channel.id)
-  channel = message.channel
-  everyone_role = message.guild.default_role
-
-  try:
-    await channel.set_permissions(everyone_role, send_messages=False)
-
-    minutes = cooldown // 60
-    rem_sec = cooldown % 60
-    time_str = f"{minutes} นาที" if rem_sec == 0 else f"{cooldown} วินาที"
-
-    info_msg = await channel.send(
-        f"⏳ **ห้องถูกล็อกชั่วคราว!** (มีการส่ง{msg_type}) กรุณารอ"
-        f" **{time_str}** ก่อนส่งรายการถัดไป"
+    # ถ้ายังไม่ติดล็อก -> เริ่มนับคูลดาวน์รูปภาพใหม่ทันที
+    state["image_until"] = now + cd
+    info = await message.channel.send(
+        f"🖼️ **ล็อกการส่งรูปภาพ/ไฟล์ชั่วคราว!** กรุณารอ **{format_time(cd)}**"
+        " ก่อนส่งรูปถัดไป *(ยังพิมพ์ข้อความคุยได้ปกติ)*"
     )
-
-    await asyncio.sleep(cooldown)
-
-    await channel.set_permissions(everyone_role, send_messages=True)
+    await asyncio.sleep(cd)
     try:
-      await info_msg.delete()
+      await info.delete()
     except:
       pass
-  except discord.Forbidden:
-    # กรณีแอดมินเซิร์ฟเวอร์ลืมให้สิทธิ์ Manage Roles หรือลากยศบอทไว้ต่ำเกินไป
-    await channel.send(
-        "⚠️ **บอทไม่มีสิทธิ์ล็อกห้อง!** กรุณาให้สิทธิ์ `Manage Roles` และลากยศของบอทไว้เหนือยศสมาชิกทั่วไป"
+
+  # กรณีที่ 2: ส่งข้อความธรรมดา (ไม่มีไฟล์แนบ)
+  else:
+    cd = g_conf["text_cooldown"]
+    if cd <= 0:
+      return  # ถ้าไม่ได้ตั้งล็อกข้อความไว้ ก็ปล่อยผ่าน
+
+    # เช็กว่าติดล็อกข้อความอยู่หรือไม่
+    if now < state["text_until"]:
+      remaining = int(state["text_until"] - now)
+      try:
+        await message.delete()
+        warn = await message.channel.send(
+            f"⏳ {message.author.mention} **ติดคูลดาวน์ข้อความ!** กรุณารออีก"
+            f" **{format_time(remaining)}**"
+        )
+        await asyncio.sleep(5)
+        await warn.delete()
+      except discord.Forbidden:
+        await message.channel.send(
+            "⚠️ บอทไม่มีสิทธิ์ลบข้อความ! กรุณาเปิดสิทธิ์ `Manage Messages` ให้บอท"
+        )
+      return
+
+    # ถ้ายังไม่ติดล็อก -> เริ่มนับคูลดาวน์ข้อความใหม่ทันที
+    state["text_until"] = now + cd
+    info = await message.channel.send(
+        f"💬 **ล็อกการส่งข้อความชั่วคราว!** กรุณารอ **{format_time(cd)}**"
+        " ก่อนส่งข้อความถัดไป"
     )
-  finally:
-    # ปลดสถานะล็อกออกจากระบบเสมอ แม้จะเกิดข้อผิดพลาด
-    locked_channels.discard(message.channel.id)
+    await asyncio.sleep(cd)
+    try:
+      await info.delete()
+    except:
+      pass
 
 
-
-def main():
-  token = os.environ.get("TOKEN")
-  if not token:
-    raise RuntimeError("TOKEN environment variable is not set.")
-  keep_alive()
-  bot.run(token)
-
-
-if __name__ == "__main__":
-  main()
+keep_alive()
+bot.run(os.environ.get("TOKEN"))
