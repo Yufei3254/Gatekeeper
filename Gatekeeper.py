@@ -1,6 +1,6 @@
 import asyncio
-import json
 import os
+import re
 from threading import Thread
 import time
 import discord
@@ -26,36 +26,36 @@ def keep_alive():
   t.start()
 
 
-# --- ระบบจัดการการตั้งค่าแยกตามเซิร์ฟเวอร์ ---
-CONFIG_FILE = "servers_config.json"
-
-
-def load_config():
-  if os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "r") as f:
-      return json.load(f)
-  return {}
-
-
-def save_config(data):
-  with open(CONFIG_FILE, "w") as f:
-    json.dump(data, f, indent=4)
-
-
-def get_guild_config(guild_id):
-  g_id = str(guild_id)
-  if g_id not in config:
-    config[g_id] = {
-        "channel_id": None,
-        "text_cooldown": 0,
-        "image_cooldown": 300,
+# --- ระบบอ่าน/บันทึกการตั้งค่าลงใน Channel Topic (จำถาวรไม่มีวันหาย) ---
+def get_channel_config(channel: discord.TextChannel):
+  topic = channel.topic or ""
+  match = re.search(r"\[GK:T=(\d+),I=(\d+)\]", topic)
+  if match:
+    return {
+        "active": True,
+        "text_cooldown": int(match.group(1)),
+        "image_cooldown": int(match.group(2)),
     }
-    save_config(config)
-  return config[g_id]
+  return {"active": False, "text_cooldown": 0, "image_cooldown": 0}
 
 
-config = load_config()
+async def save_channel_config(
+    channel: discord.TextChannel, text_cd: int, image_cd: int, active: bool
+):
+  topic = channel.topic or ""
+  clean_topic = re.sub(r"\s*\[GK:T=\d+,I=\d+\]", "", topic).strip()
+
+  if active and (text_cd > 0 or image_cd > 0):
+    tag = f"[GK:T={text_cd},I={image_cd}]"
+    new_topic = f"{clean_topic} {tag}".strip() if clean_topic else tag
+  else:
+    new_topic = clean_topic
+
+  await channel.edit(topic=new_topic)
+
+
 lock_states = {}
+allowed_messages = set()
 
 # --- ตั้งค่าบอท Discord ---
 intents = discord.Intents.default()
@@ -78,41 +78,25 @@ def format_time(seconds: int) -> str:
     return f"{seconds} วินาที"
 
 
-# --- คำสั่ง Slash Commands (แสดงข้อความให้ทุกคนเห็นในแชท) ---
+# --- คำสั่ง Slash Commands ---
 
 
 @bot.tree.command(
-    name="set_channel", description="เลือกห้องแชทที่จะเปิดใช้งานระบบล็อกเวลา"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def set_channel(
-    interaction: discord.Interaction, channel: discord.TextChannel
-):
-  g_conf = get_guild_config(interaction.guild_id)
-  g_conf["channel_id"] = channel.id
-  save_config(config)
-  await interaction.response.send_message(
-      f"✅ {interaction.user.mention} เปิดใช้งานระบบล็อกเวลาที่ห้อง"
-      f" {channel.mention} เรียบร้อยแล้ว!"
-  )
-
-
-@bot.tree.command(
-    name="set_cooldown",
-    description="ตั้งเวลาดีเลย์ (เลือกประเภทและหน่วยเวลาได้เอง)",
+    name="set_cooldown", description="เลือกห้องและตั้งเวลาดีเลย์ (จำค่าถาวร)"
 )
 @app_commands.describe(
-    target="เลือกสิ่งที่จะล็อก (ข้อความ หรือ รูปภาพ/ไฟล์)",
+    channel="เลือกห้องแชทที่ต้องการตั้งค่า",
+    target="เลือกสิ่งที่จะล็อก (ข้อความ หรือ รูปภาพ/ไฟล์/ลิงก์)",
     amount="ใส่จำนวนเวลา (ใส่ 0 เพื่อปิดการล็อกประเภทนี้)",
     unit="เลือกหน่วยเวลา (วินาที / นาที / ชั่วโมง)",
 )
 @app_commands.choices(
     target=[
         app_commands.Choice(
-            name="💬 ข้อความอย่างเดียว (Text Only)", value="text"
+            name="ข้อความอย่างเดียว (Text Only)", value="text"
         ),
         app_commands.Choice(
-            name="🖼️ รูปภาพ/วิดีโอ/ไฟล์ (Media/Files)", value="image"
+            name="รูปภาพ/ไฟล์/GIF/ลิงก์ (Media & Links)", value="image"
         ),
     ],
     unit=[
@@ -124,88 +108,114 @@ async def set_channel(
 @app_commands.checks.has_permissions(administrator=True)
 async def set_cooldown(
     interaction: discord.Interaction,
+    channel: discord.TextChannel,
     target: app_commands.Choice[str],
     amount: int,
     unit: app_commands.Choice[int],
 ):
   if amount < 0:
     await interaction.response.send_message(
-        "❌ กรุณาใส่ตัวเลข 0 ขึ้นไป", ephemeral=True
+        "กรุณาใส่ตัวเลข 0 ขึ้นไปครับ", ephemeral=True
     )
     return
 
+  await interaction.response.defer()
+
+  current_conf = get_channel_config(channel)
+  text_cd = current_conf["text_cooldown"]
+  image_cd = current_conf["image_cooldown"]
   total_seconds = amount * unit.value
-  g_conf = get_guild_config(interaction.guild_id)
 
   if target.value == "text":
-    g_conf["text_cooldown"] = total_seconds
+    text_cd = total_seconds
   else:
-    g_conf["image_cooldown"] = total_seconds
+    image_cd = total_seconds
 
-  save_config(config)
+  try:
+    is_active = text_cd > 0 or image_cd > 0
+    await save_channel_config(channel, text_cd, image_cd, active=is_active)
 
-  if total_seconds == 0:
-    msg = (
-        f"✅ {interaction.user.mention} **ปิดการล็อก** สำหรับ **{target.name}**"
-        " เรียบร้อยแล้ว!"
+    if total_seconds == 0:
+      msg = (
+          f"✅ {interaction.user.mention} **ปิดการล็อก** สำหรับ"
+          f" **{target.name}** ในห้อง {channel.mention} เรียบร้อยแล้ว"
+      )
+    else:
+      msg = (
+          f"✅ {interaction.user.mention} ตั้งเวลาล็อก **{target.name}** ในห้อง"
+          f" {channel.mention} เป็น **{amount} {unit.name}** เรียบร้อย"
+          " *(บันทึกถาวร)*"
+      )
+    await interaction.followup.send(msg)
+  except discord.Forbidden:
+    await interaction.followup.send(
+        f"**บอทไม่มีสิทธิ์แก้ไขหัวข้อห้อง {channel.mention}** กรุณาเปิดสิทธิ์"
+        " `Manage Channels` ให้บอทก่อนครับ"
     )
-  else:
-    msg = (
-        f"✅ {interaction.user.mention} ตั้งเวลาล็อก **{target.name}** เป็น"
-        f" **{amount} {unit.name}** เรียบร้อย!"
-    )
-
-  await interaction.response.send_message(msg)
 
 
-@bot.tree.command(
-    name="disable", description="ปิดการทำงานของบอทในเซิร์ฟเวอร์นี้ชั่วคราว"
-)
+@bot.tree.command(name="disable", description="เลือกห้องเพื่อปิดระบบล็อกเวลา")
+@app_commands.describe(channel="เลือกห้องแชทที่ต้องการปิดระบบล็อก")
 @app_commands.checks.has_permissions(administrator=True)
-async def disable(interaction: discord.Interaction):
-  g_conf = get_guild_config(interaction.guild_id)
-  g_conf["channel_id"] = None
-  save_config(config)
-  await interaction.response.send_message(
-      f"🛑 {interaction.user.mention}"
-      " ปิดการทำงานของระบบล็อกเวลาในเซิร์ฟเวอร์นี้แล้ว"
-  )
+async def disable(
+    interaction: discord.Interaction, channel: discord.TextChannel
+):
+  await interaction.response.defer()
+  try:
+    await save_channel_config(channel, 0, 0, active=False)
+    await interaction.followup.send(
+        f"✅ {interaction.user.mention} ปิดระบบล็อกเวลาในห้อง"
+        f" {channel.mention} เรียบร้อยแล้ว"
+    )
+  except discord.Forbidden:
+    await interaction.followup.send(
+        f"**บอทไม่มีสิทธิ์แก้ไขหัวข้อห้อง {channel.mention}** กรุณาเปิดสิทธิ์"
+        " `Manage Channels` ให้บอท"
+    )
 
 
 @bot.tree.command(
-    name="status", description="ตรวจสอบการตั้งค่าปัจจุบันของเซิร์ฟเวอร์นี้"
+    name="status", description="ตรวจสอบการตั้งค่าของห้อง (เลือกห้องได้)"
 )
-async def status(interaction: discord.Interaction):
-  g_conf = get_guild_config(interaction.guild_id)
-  ch_id = g_conf.get("channel_id")
-  ch_text = f"<#{ch_id}>" if ch_id else "ปิดใช้งานอยู่ (ใช้ /set_channel เพื่อเปิด)"
+@app_commands.describe(channel="เลือกห้องที่ต้องการดู (ไม่เลือก = ดูห้องนี้)")
+async def status(
+    interaction: discord.Interaction, channel: discord.TextChannel = None
+):
+  target_channel = channel or interaction.channel
+  conf = get_channel_config(target_channel)
 
-  t_cd = g_conf["text_cooldown"]
-  i_cd = g_conf["image_cooldown"]
+  t_cd = conf["text_cooldown"]
+  i_cd = conf["image_cooldown"]
 
   t_str = format_time(t_cd) if t_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
   i_str = format_time(i_cd) if i_cd > 0 else "ไม่ล็อก (ส่งได้ตลอด)"
 
-  embed = discord.Embed(
-      title=f"⚙️ สถานะระบบคูลดาวน์ ({interaction.guild.name})",
-      color=discord.Color.blue(),
+  status_text = (
+      "เปิดใช้งานอยู่ (บันทึกถาวร)" if conf["active"] else "ปิดใช้งานอยู่"
   )
-  embed.add_field(name="📍 ห้องที่ใช้งาน", value=ch_text, inline=False)
-  embed.add_field(name="💬 ล็อกข้อความ", value=t_str, inline=True)
-  embed.add_field(name="🖼️ ล็อกรูปภาพ/ไฟล์", value=i_str, inline=True)
+
+  embed = discord.Embed(
+      title=f"สถานะระบบคูลดาวน์ของห้อง #{target_channel.name}",
+      color=discord.Color.green() if conf["active"] else discord.Color.red(),
+  )
+  embed.add_field(name="สถานะ", value=status_text, inline=False)
+  embed.add_field(name="ล็อกข้อความ", value=t_str, inline=True)
+  embed.add_field(name="ล็อกรูปภาพ/ไฟล์/ลิงก์", value=i_str, inline=True)
   await interaction.response.send_message(embed=embed)
 
 
-# --- ระบบตรวจจับและบังคับล็อกทุกคน (รวม Owner/Admin) ---
+# --- ฟังก์ชันตรวจจับและจัดการข้อความ ---
 
 
-@bot.event
-async def on_message(message):
+async def process_message(message, is_edit=False):
   if message.author.bot or not message.guild:
     return
 
-  g_conf = get_guild_config(message.guild.id)
-  if not g_conf["channel_id"] or message.channel.id != g_conf["channel_id"]:
+  if message.id in allowed_messages:
+    return
+
+  conf = get_channel_config(message.channel)
+  if not conf["active"]:
     return
 
   ch_id = message.channel.id
@@ -215,73 +225,94 @@ async def on_message(message):
     lock_states[ch_id] = {"text_until": 0, "image_until": 0}
 
   state = lock_states[ch_id]
-  has_media = len(message.attachments) > 0
 
-  # กรณีที่ 1: ส่งรูปภาพ / วิดีโอ / ไฟล์
+  content_lower = message.content.lower()
+  has_media = (
+      len(message.attachments) > 0
+      or len(message.embeds) > 0
+      or "http://" in content_lower
+      or "https://" in content_lower
+      or "tenor.com" in content_lower
+      or "giphy.com" in content_lower
+  )
+
+  # 1. หมวดรูปภาพ / ไฟล์ / GIF / ลิงก์
   if has_media:
-    cd = g_conf["image_cooldown"]
+    cd = conf["image_cooldown"]
     if cd <= 0:
       return
 
     if now < state["image_until"]:
-      remaining = int(state["image_until"] - now)
+      remaining = max(1, int(state["image_until"] - now))
       try:
         await message.delete()
         warn = await message.channel.send(
-            f"⏳ {message.author.mention} **ติดคูลดาวน์รูปภาพ/ไฟล์!** กรุณารออีก"
-            f" **{format_time(remaining)}**"
+            f"{message.author.mention} **ติดคูลดาวน์รูปภาพ/ลิงก์**"
+            f" กรุณารออีก **{format_time(remaining)}**"
         )
         await asyncio.sleep(5)
         await warn.delete()
       except discord.Forbidden:
-        await message.channel.send(
-            "⚠️ บอทไม่มีสิทธิ์ลบข้อความ! กรุณาเปิดสิทธิ์ `Manage Messages` ให้บอท"
-        )
+        pass
       return
 
+    allowed_messages.add(message.id)
     state["image_until"] = now + cd
+
     info = await message.channel.send(
-        f"**ล็อกการส่งรูปภาพ/ไฟล์ชั่วคราว!** กรุณารอ **{format_time(cd)}**"
-        " ก่อนส่งรูปถัดไป *(ยังพิมพ์ข้อความคุยได้ปกติ)*"
+        f"**ล็อกการส่งรูปภาพ/ลิงก์ชั่วคราว** กรุณารอ **{format_time(cd)}**"
+        " ก่อนส่งรายการถัดไป"
     )
     await asyncio.sleep(cd)
+    allowed_messages.discard(message.id)
     try:
       await info.delete()
     except:
       pass
 
-  # กรณีที่ 2: ส่งข้อความธรรมดา
-  else:
-    cd = g_conf["text_cooldown"]
+  # 2. หมวดข้อความธรรมดา
+  elif not is_edit:
+    cd = conf["text_cooldown"]
     if cd <= 0:
       return
 
     if now < state["text_until"]:
-      remaining = int(state["text_until"] - now)
+      remaining = max(1, int(state["text_until"] - now))
       try:
         await message.delete()
         warn = await message.channel.send(
-            f"⏳ {message.author.mention} **ติดคูลดาวน์ข้อความ!** กรุณารออีก"
-            f" **{format_time(remaining)}**"
+            f"{message.author.mention} **ติดคูลดาวน์ข้อความ**"
+            f" กรุณารออีก **{format_time(remaining)}**"
         )
         await asyncio.sleep(5)
         await warn.delete()
       except discord.Forbidden:
-        await message.channel.send(
-            "⚠️ บอทไม่มีสิทธิ์ลบข้อความ! กรุณาเปิดสิทธิ์ `Manage Messages` ให้บอท"
-        )
+        pass
       return
 
+    allowed_messages.add(message.id)
     state["text_until"] = now + cd
+
     info = await message.channel.send(
-        f"**ล็อกการส่งข้อความชั่วคราว!** กรุณารอ **{format_time(cd)}**"
+        f"**ล็อกการส่งข้อความชั่วคราว** กรุณารอ **{format_time(cd)}**"
         " ก่อนส่งข้อความถัดไป"
     )
     await asyncio.sleep(cd)
+    allowed_messages.discard(message.id)
     try:
       await info.delete()
     except:
       pass
+
+
+@bot.event
+async def on_message(message):
+  await process_message(message, is_edit=False)
+
+
+@bot.event
+async def on_message_edit(before, after):
+  await process_message(after, is_edit=True)
 
 
 keep_alive()
